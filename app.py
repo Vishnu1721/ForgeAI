@@ -159,6 +159,19 @@ def change_cost(sku:str,b:Cost,a=Depends(auth)):
     with db() as c:
         p=get(c,'products',a[0],sku); old=p['cost']; p['cost']=b.cost; put(c,'products',a[0],sku,p); audit(c,a[0],'cost_change',sku)
         return dict(old=old,new=b.cost,recommended_unit_price=round(b.cost/.7),affected_quotes=[q['id'] for q in rows(c,'quotes',a[0]) if any(i['sku']==sku for i in q['items'])])
+@app.get('/api/selling/recommendations')
+def recommendations(description:str,unit:str,customer_id:str,quantity:int=1,a=Depends(auth)):
+    if not 0<quantity<=1000000: raise HTTPException(422,'Invalid quantity')
+    with db() as c:
+        products=erp(c,a[0]).catalog()
+        customer=crm(c,a[0]).account(customer_id)
+        policy=pricing_policy(c,a[0])
+    result=[]
+    for candidate in rank(description,unit,products)[:5]:
+        p=candidate['product']
+        result.append(dict(sku=p['id'],name=p['name'],score=candidate['score'],available=p['stock']>=quantity,stock=p['stock'],estimate=price(p,quantity,customer,policy),requires_specification_review=True))
+    return {"recommendations":result,"warning":"Suggestions are not approved substitutes or binding quotations"}
+
 @app.get('/api/guidance/{sku}')
 def guidance(sku:str,a=Depends(auth)):
     with db() as c:
