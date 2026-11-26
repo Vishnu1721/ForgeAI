@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from pathlib import Path
 from ingestion import document_text, MAX_BYTES
 from extraction import extract_request
+from agents import orchestrate
 from matching import resolve, rank
 from pricing import price, PricingPolicy, requires_approval
 from connectors import SQLiteERP, SQLiteCRM
@@ -75,16 +76,7 @@ def rfq(body:RFQ,a=Depends(auth)):
         extracted, mode = extract_request(body.text)
     except Exception as exc:
         raise HTTPException(503,'Extraction unavailable; retry safely') from exc
-    lines=extracted.items; items=[]; issues=list(extracted.issues)
-    if not lines: issues.append('No complete product lines extracted')
-    for line in lines:
-        p,candidates=resolve(line.description,line.unit,products)
-        if not p: issues.append('Clarify product: '+line.description); continue
-        item=price(p,line.quantity,customer,policy); items.append(item)
-    for sku in {i['sku'] for i in items}:
-        if sum(i['quantity'] for i in items if i['sku']==sku)>next(p['stock'] for p in products if p['id']==sku): issues.append('Insufficient stock: '+sku)
-    total=sum(i['total'] for i in items); cost=sum(i['cost'] for i in items)
-    q=dict(customer=body.customer,text=body.text,items=items,issues=issues,extraction_mode=mode,extracted_lines=[line.model_dump() for line in lines],total=total,cost=cost,status='clarification' if issues else 'approval' if requires_approval(items,total,policy) else 'review')
+    q=orchestrate(extracted,mode,body.customer,body.text,customer,products,policy)
     with db() as c:
         existing=c.execute('SELECT data FROM quotes WHERE tenant=? AND id=?',(t,id)).fetchone()
         if existing: raise HTTPException(409,'Concurrent request; retry')
