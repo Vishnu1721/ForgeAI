@@ -8,6 +8,7 @@ from pathlib import Path
 from ingestion import document_text, MAX_BYTES
 from extraction import extract_request
 from agents import orchestrate
+from quote_email import compose
 from matching import resolve, rank
 from pricing import price, PricingPolicy, requires_approval
 from connectors import SQLiteERP, SQLiteCRM
@@ -133,6 +134,13 @@ def catalog_search(description:str,unit:str,a=Depends(auth)):
 def listing(table:str,a=Depends(auth)):
     if table not in ['products','customers','quotes','audit','orders','inbox','outbox']: raise HTTPException(404)
     with db() as c: return rows(c,table,a[0])
+@app.get('/api/quotes/{id}/email')
+def email_preview(id:str,a=Depends(auth)):
+    with db() as c:
+        q=get(c,'quotes',a[0],id)
+        if q['status'] not in ('approved','sent','ordered'): raise HTTPException(409,'Approval required')
+        return compose(id,q,crm(c,a[0]).account(q['customer']))
+
 @app.post('/api/quotes/{id}/{action}')
 def transition(id:str,action:str,a=Depends(auth)):
     t,role=a
@@ -145,7 +153,7 @@ def transition(id:str,action:str,a=Depends(auth)):
             for i in q['items']:
                 p=erp(c,t).product(i['sku']); customer=crm(c,t).account(q['customer'])
                 if any(price(dict(id=i['sku'],**p),i['quantity'],customer,pricing_policy(c,t)).get(k)!=v for k,v in i.items()): raise HTTPException(409,'Price changed; create new quote')
-            q['status']='sent'; put(c,'outbox',t,id,dict(customer=q['customer'],quote=q,delivery='simulated'))
+            q['status']='sent'; put(c,'outbox',t,id,dict(customer=q['customer'],quote=q,delivery='simulated',message=compose(id,q,crm(c,t).account(q['customer']))))
         elif action=='accept' and status=='sent':
             erp(c,t).reserve(id,q['items'],q['total'])
             q['status']='ordered'
