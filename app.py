@@ -8,6 +8,8 @@ from pathlib import Path
 from ingestion import document_text, MAX_BYTES
 from extraction import extract_request
 from matching import resolve, rank
+from pricing import price, PricingPolicy, requires_approval
+from connectors import SQLiteERP, SQLiteCRM
 ROOT=Path(__file__).parent
 DB=os.getenv('FORGE_DB',str(ROOT/'forge.db'))
 app=FastAPI(title='ForgeAI')
@@ -20,7 +22,7 @@ def db():
     finally: c.close()
 def init():
     with db() as c:
-        for table in ['products','customers','quotes','audit','orders','inbox','outbox']:
+        for table in ['products','customers','quotes','audit','orders','inbox','outbox','settings']:
             c.execute(f'CREATE TABLE IF NOT EXISTS {table}(tenant TEXT,id TEXT,data TEXT,PRIMARY KEY(tenant,id))')
         for tenant in ['demo','other']:
             for i,(name,unit,cost) in enumerate([('Sodium chloride industrial grade','kg',120),('Ethanol 99%','L',240),('Steel sheet 304','kg',450),('Acetone technical grade','L',180),('Copper wire','m',320)]):
@@ -33,6 +35,13 @@ def get(c,t,tenant,id):
     return json.loads(r[0])
 def put(c,t,tenant,id,data): c.execute(f'INSERT OR REPLACE INTO {t} VALUES(?,?,?)',(tenant,id,json.dumps(data)))
 def rows(c,t,tenant): return [dict(id=r[0],**json.loads(r[1])) for r in c.execute(f'SELECT id,data FROM {t} WHERE tenant=?',(tenant,))]
+def erp(c,t): return SQLiteERP(c,t,get,put,rows)
+def crm(c,t): return SQLiteCRM(c,t,get,rows)
+
+def pricing_policy(c,t):
+    row=c.execute("SELECT data FROM settings WHERE tenant=? AND id='pricing'",(t,)).fetchone()
+    return PricingPolicy.model_validate_json(row[0]) if row else PricingPolicy()
+
 def uid(): return uuid.uuid4().hex[:16]
 def audit(c,t,action,record): put(c,'audit',t,uid(),dict(action=action,record=record))
 init()
@@ -42,11 +51,6 @@ def auth(authorization:str=Header('')):
     return tokens[authorization[7:]]
 class RFQ(BaseModel):
     customer:str; text:str=Field(min_length=1,max_length=20000); source_id:str=Field(min_length=1,max_length=200)
-def price(p,qty,customer):
-    cost=p['cost']*qty; discount=customer['discount']+(5 if qty>=1000 else 0)
-    total=int((Decimal(cost)/Decimal('.70')*(1-Decimal(discount)/100)).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
-    if p['id'] in customer['contract']: total=customer['contract'][p['id']]*qty
-    return dict(sku=p['id'],name=p['name'],quantity=qty,unit=p['unit'],cost=cost,total=total,margin=round((total-cost)/total*100,2) if total else -100)
 @app.post('/api/documents/preview')
 def preview_document(file: UploadFile = File(...), a=Depends(auth)):
     try:
@@ -66,7 +70,7 @@ def rfq(body:RFQ,a=Depends(auth)):
             old=json.loads(existing[0]);
             if old['text']!=body.text or old['customer']!=body.customer: raise HTTPException(409,'Source ID already used')
             return dict(id=id,**old)
-        customer=get(c,'customers',t,body.customer); products=rows(c,'products',t)
+        customer=crm(c,t).account(body.customer); products=erp(c,t).catalog(); policy=pricing_policy(c,t)
     try:
         extracted, mode = extract_request(body.text)
     except Exception as exc:
@@ -76,20 +80,37 @@ def rfq(body:RFQ,a=Depends(auth)):
     for line in lines:
         p,candidates=resolve(line.description,line.unit,products)
         if not p: issues.append('Clarify product: '+line.description); continue
-        item=price(p,line.quantity,customer); items.append(item)
+        item=price(p,line.quantity,customer,policy); items.append(item)
     for sku in {i['sku'] for i in items}:
         if sum(i['quantity'] for i in items if i['sku']==sku)>next(p['stock'] for p in products if p['id']==sku): issues.append('Insufficient stock: '+sku)
     total=sum(i['total'] for i in items); cost=sum(i['cost'] for i in items)
-    q=dict(customer=body.customer,text=body.text,items=items,issues=issues,extraction_mode=mode,extracted_lines=[line.model_dump() for line in lines],total=total,cost=cost,status='clarification' if issues else 'approval' if any(i['margin']<20 for i in items) or total>2000000 else 'review')
+    q=dict(customer=body.customer,text=body.text,items=items,issues=issues,extraction_mode=mode,extracted_lines=[line.model_dump() for line in lines],total=total,cost=cost,status='clarification' if issues else 'approval' if requires_approval(items,total,policy) else 'review')
     with db() as c:
         existing=c.execute('SELECT data FROM quotes WHERE tenant=? AND id=?',(t,id)).fetchone()
         if existing: raise HTTPException(409,'Concurrent request; retry')
         put(c,'inbox',t,id,body.model_dump()); put(c,'quotes',t,id,q); audit(c,t,'draft',id)
     return dict(id=id,**q)
+@app.get('/api/integrations/status')
+def integration_status(a=Depends(auth)):
+    return {"erp":{"provider":"sqlite","mode":"simulated"},"crm":{"provider":"sqlite","mode":"simulated"}}
+
+@app.get('/api/pricing/policy')
+def read_policy(a=Depends(auth)):
+    with db() as c: return pricing_policy(c,a[0])
+
+@app.post('/api/pricing/policy')
+def update_policy(policy:PricingPolicy,a=Depends(auth)):
+    if a[1]!='manager': raise HTTPException(403,'Manager required')
+    if policy.minimum_margin>policy.target_margin: raise HTTPException(422,'Minimum exceeds target margin')
+    with db() as c:
+        put(c,'settings',a[0],'pricing',policy.model_dump())
+        audit(c,a[0],'pricing_policy_change','pricing')
+    return policy
+
 @app.get('/api/catalog/search')
 def catalog_search(description:str,unit:str,a=Depends(auth)):
     with db() as c:
-        products=rows(c,'products',a[0])
+        products=erp(c,a[0]).catalog()
     return rank(description,unit,products)[:10]
 
 @app.get('/api/{table}')
@@ -106,15 +127,12 @@ def transition(id:str,action:str,a=Depends(auth)):
             q['status']='approved'
         elif action=='send' and status=='approved':
             for i in q['items']:
-                p=get(c,'products',t,i['sku']); customer=get(c,'customers',t,q['customer'])
-                if price(dict(id=i['sku'],**p),i['quantity'],customer)!=i: raise HTTPException(409,'Price changed; create new quote')
+                p=erp(c,t).product(i['sku']); customer=crm(c,t).account(q['customer'])
+                if any(price(dict(id=i['sku'],**p),i['quantity'],customer,pricing_policy(c,t)).get(k)!=v for k,v in i.items()): raise HTTPException(409,'Price changed; create new quote')
             q['status']='sent'; put(c,'outbox',t,id,dict(customer=q['customer'],quote=q,delivery='simulated'))
         elif action=='accept' and status=='sent':
-            for sku in {i['sku'] for i in q['items']}:
-                p=get(c,'products',t,sku); qty=sum(i['quantity'] for i in q['items'] if i['sku']==sku)
-                if p['stock']<qty: raise HTTPException(409,'Insufficient inventory')
-                p['stock']-=qty; put(c,'products',t,sku,p)
-            q['status']='ordered'; put(c,'orders',t,id,dict(quote_id=id,total=q['total'],status='reserved'))
+            erp(c,t).reserve(id,q['items'],q['total'])
+            q['status']='ordered'
         elif action=='reject' and status in ['review','approval','approved']: q['status']='rejected'
         else: raise HTTPException(409,'Invalid state transition')
         put(c,'quotes',t,id,q); audit(c,t,action,id); return q
