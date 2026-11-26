@@ -1,0 +1,13 @@
+.git
+.venv
+venv
+.env*
+*.db
+*.db-*
+*.sqlite*
+__pycache__
+.pytest_cache
+*.pem
+*.key
+credentials.json
+token.json
