@@ -65,7 +65,7 @@ def extract_request(text):
     result = Extraction.model_validate_json(choice["message"]["content"])
     valid, issues = [], list(result.issues)
     for item in result.items:
-        if item.evidence not in text or item.description.casefold() not in item.evidence.casefold() or not re.search(r"(?<![\d.])"+str(item.quantity)+r"(?![\d.])",item.evidence):
+        if item.evidence not in text or item.description.casefold() not in item.evidence.casefold() or not re.search(r"(?<![\d.])"+str(item.quantity)+r"(?![\d.])",item.evidence) or not re.search(r"\b"+({"l":r"(?:l|liters?)","kg":"kg","m":"m"}[item.unit])+r"\b",item.evidence,re.I):
             issues.append("Unverified extraction: "+item.description)
         else:
             valid.append(item)
