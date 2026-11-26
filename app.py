@@ -1,3 +1,4 @@
+import time
 import os, sqlite3, json, re, uuid, hmac, hashlib, urllib.request, difflib
 from decimal import Decimal, ROUND_HALF_UP
 from contextlib import contextmanager
@@ -16,6 +17,11 @@ from connectors import SQLiteERP, SQLiteCRM
 ROOT=Path(__file__).parent
 DB=os.getenv('FORGE_DB',str(ROOT/'forge.db'))
 app=FastAPI(title='ForgeAI')
+if os.getenv('FORGE_ENV')=='production':
+    secrets=[os.getenv(k,'') for k in ('SALES_TOKEN','MANAGER_TOKEN','OTHER_TOKEN')]
+    if any(len(k)<32 or k in ('demo-sales','demo-manager','other-sales') for k in secrets) or len(set(secrets))!=3:
+        raise RuntimeError('Production requires three distinct strong tokens')
+
 @contextmanager
 def db():
     c=sqlite3.connect(DB,timeout=20); c.row_factory=sqlite3.Row
@@ -77,6 +83,9 @@ def rfq(body:RFQ,a=Depends(auth)):
         row=c.execute("SELECT data FROM workflows WHERE tenant=? AND id=?",(t,id)).fetchone()
         state=json.loads(row[0]) if row else {"request":body.model_dump(),"attempts":0}
         if state["request"]!=body.model_dump(): raise HTTPException(409,'Source ID already used')
+        if state.get("lease_until",0)>time.time(): raise HTTPException(409,'Workflow already running')
+        state["lease_until"]=time.time()+300
+        state["owner"]=uuid.uuid4().hex
         state["attempts"]+=1
         state["status"]="running"
         put(c,'workflows',t,id,state)
@@ -88,19 +97,23 @@ def rfq(body:RFQ,a=Depends(auth)):
         else:
             extracted,mode=extract_request(body.text)
             with db() as c:
+                if get(c,'workflows',t,id).get('owner')!=state['owner']: raise HTTPException(409,'Workflow lease lost')
                 state.update(extraction=extracted.model_dump(),mode=mode,status="extracted")
                 put(c,'workflows',t,id,state)
         q=orchestrate(extracted,mode,body.customer,body.text,customer,products,policy)
     except Exception as exc:
         with db() as c:
-            state["status"]="retryable"
-            put(c,'workflows',t,id,state)
+            if get(c,'workflows',t,id).get('owner')==state['owner']:
+                state["status"]="retryable"
+                state["lease_until"]=0
+                put(c,'workflows',t,id,state)
         raise HTTPException(503,'Workflow unavailable; retry with same source ID') from exc
     with db() as c:
         existing=c.execute('SELECT data FROM quotes WHERE tenant=? AND id=?',(t,id)).fetchone()
         if existing: raise HTTPException(409,'Concurrent request; retry')
+        if get(c,'workflows',t,id).get('owner')!=state['owner']: raise HTTPException(409,'Workflow lease lost')
         put(c,'inbox',t,id,body.model_dump()); put(c,'quotes',t,id,q); audit(c,t,'draft',id)
-        state['status']='completed'; put(c,'workflows',t,id,state)
+        state['status']='completed'; state['lease_until']=0; put(c,'workflows',t,id,state)
     return dict(id=id,**q)
 @app.get('/api/workflows/{id}')
 def workflow_status(id:str,a=Depends(auth)):
@@ -172,7 +185,7 @@ def change_cost(sku:str,b:Cost,a=Depends(auth)):
     if a[1]!='manager': raise HTTPException(403)
     with db() as c:
         p=get(c,'products',a[0],sku); old=p['cost']; p['cost']=b.cost; put(c,'products',a[0],sku,p); audit(c,a[0],'cost_change',sku)
-        return dict(old=old,new=b.cost,recommended_unit_price=round(b.cost/.7),affected_quotes=[q['id'] for q in rows(c,'quotes',a[0]) if any(i['sku']==sku for i in q['items'])])
+        return dict(old=old,new=b.cost,recommended_unit_price=round(b.cost/(1-pricing_policy(c,a[0]).target_margin/100)),affected_quotes=[q['id'] for q in rows(c,'quotes',a[0]) if any(i['sku']==sku for i in q['items'])])
 @app.get('/api/selling/recommendations')
 def recommendations(description:str,unit:str,customer_id:str,quantity:int=1,a=Depends(auth)):
     if not 0<quantity<=1000000: raise HTTPException(422,'Invalid quantity')
@@ -189,5 +202,5 @@ def recommendations(description:str,unit:str,customer_id:str,quantity:int=1,a=De
 @app.get('/api/guidance/{sku}')
 def guidance(sku:str,a=Depends(auth)):
     with db() as c:
-        p=get(c,'products',a[0],sku); return dict(product=p,recommended_unit_price=round(p['cost']/.7),alternatives=[x for x in rows(c,'products',a[0]) if x['unit']==p['unit'] and x['id']!=sku],warning='Alternatives require specification verification')
+        p=get(c,'products',a[0],sku); return dict(product=p,recommended_unit_price=round(p['cost']/(1-pricing_policy(c,a[0]).target_margin/100)),alternatives=[x for x in rows(c,'products',a[0]) if x['unit']==p['unit'] and x['id']!=sku],warning='Alternatives require specification verification')
 app.mount('/',StaticFiles(directory=ROOT/'static',html=True),name='ui')
