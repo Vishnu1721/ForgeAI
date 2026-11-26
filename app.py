@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from pathlib import Path
 from ingestion import document_text, MAX_BYTES
 from extraction import extract_request
+from matching import resolve, rank
 ROOT=Path(__file__).parent
 DB=os.getenv('FORGE_DB',str(ROOT/'forge.db'))
 app=FastAPI(title='ForgeAI')
@@ -41,16 +42,6 @@ def auth(authorization:str=Header('')):
     return tokens[authorization[7:]]
 class RFQ(BaseModel):
     customer:str; text:str=Field(min_length=1,max_length=20000); source_id:str=Field(min_length=1,max_length=200)
-def match(line,products):
-    unit={'liter':'l','liters':'l'}.get(line.unit.lower(),line.unit.lower()); s=line.description.lower()
-    candidates=[]
-    for p in products:
-        if p['unit'].lower()!=unit: continue
-        score=1 if s==p['id'].lower() or s==p['name'].lower() else difflib.SequenceMatcher(None,s,p['name'].lower()).ratio()
-        candidates.append((score,p))
-    candidates.sort(key=lambda x:x[0],reverse=True)
-    if not candidates or candidates[0][0]<.85 or (len(candidates)>1 and candidates[0][0]-candidates[1][0]<.1): return None
-    return candidates[0][1]
 def price(p,qty,customer):
     cost=p['cost']*qty; discount=customer['discount']+(5 if qty>=1000 else 0)
     total=int((Decimal(cost)/Decimal('.70')*(1-Decimal(discount)/100)).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
@@ -83,7 +74,7 @@ def rfq(body:RFQ,a=Depends(auth)):
     lines=extracted.items; items=[]; issues=list(extracted.issues)
     if not lines: issues.append('No complete product lines extracted')
     for line in lines:
-        p=match(line,products)
+        p,candidates=resolve(line.description,line.unit,products)
         if not p: issues.append('Clarify product: '+line.description); continue
         item=price(p,line.quantity,customer); items.append(item)
     for sku in {i['sku'] for i in items}:
@@ -95,6 +86,12 @@ def rfq(body:RFQ,a=Depends(auth)):
         if existing: raise HTTPException(409,'Concurrent request; retry')
         put(c,'inbox',t,id,body.model_dump()); put(c,'quotes',t,id,q); audit(c,t,'draft',id)
     return dict(id=id,**q)
+@app.get('/api/catalog/search')
+def catalog_search(description:str,unit:str,a=Depends(auth)):
+    with db() as c:
+        products=rows(c,'products',a[0])
+    return rank(description,unit,products)[:10]
+
 @app.get('/api/{table}')
 def listing(table:str,a=Depends(auth)):
     if table not in ['products','customers','quotes','audit','orders','inbox','outbox']: raise HTTPException(404)
