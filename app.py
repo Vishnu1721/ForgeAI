@@ -8,6 +8,7 @@ from pathlib import Path
 from ingestion import document_text, MAX_BYTES
 from extraction import extract_request
 from agents import orchestrate
+from analytics import summarize
 from quote_email import compose
 from matching import resolve, rank
 from pricing import price, PricingPolicy, requires_approval
@@ -129,6 +130,11 @@ def catalog_search(description:str,unit:str,a=Depends(auth)):
     with db() as c:
         products=erp(c,a[0]).catalog()
     return rank(description,unit,products)[:10]
+
+@app.get('/api/analytics/summary')
+def analytics_summary(a=Depends(auth)):
+    with db() as c:
+        return summarize(rows(c,'quotes',a[0]))
 
 @app.get('/api/{table}')
 def listing(table:str,a=Depends(auth)):
