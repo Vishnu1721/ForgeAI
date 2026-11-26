@@ -2,6 +2,8 @@
 import csv
 import io
 import zipfile
+from email import policy
+from email.parser import BytesParser
 from pathlib import Path
 
 MAX_BYTES = 2 * 1024 * 1024
@@ -61,8 +63,14 @@ def document_text(filename, data):
             if sum(map(len, parts)) > MAX_TEXT:
                 raise ValueError("Extracted text exceeds limit")
         text = "\n".join(parts)
+    elif ext == ".eml":
+        message = BytesParser(policy=policy.default).parsebytes(data)
+        part = message.get_body(preferencelist=("plain",))
+        if part is None or list(message.iter_attachments()):
+            raise ValueError("Use plain-text email without attachments; upload attachments separately")
+        text = part.get_content()
     else:
-        raise ValueError("Supported formats: TXT, CSV, XLSX, PDF")
+        raise ValueError("Supported formats: TXT, CSV, XLSX, PDF, EML")
     if not text.strip() or len(text) > MAX_TEXT:
         raise ValueError("No readable text or text exceeds 20,000 characters")
     return text.strip()
