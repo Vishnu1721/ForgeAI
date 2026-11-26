@@ -1,10 +1,11 @@
 import os, sqlite3, json, re, uuid, hmac, hashlib, urllib.request, difflib
 from decimal import Decimal, ROUND_HALF_UP
 from contextlib import contextmanager
-from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pathlib import Path
+from ingestion import document_text, MAX_BYTES
 ROOT=Path(__file__).parent
 DB=os.getenv('FORGE_DB',str(ROOT/'forge.db'))
 app=FastAPI(title='ForgeAI')
@@ -67,6 +68,16 @@ def price(p,qty,customer):
     total=int((Decimal(cost)/Decimal('.70')*(1-Decimal(discount)/100)).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
     if p['id'] in customer['contract']: total=customer['contract'][p['id']]*qty
     return dict(sku=p['id'],name=p['name'],quantity=qty,unit=p['unit'],cost=cost,total=total,margin=round((total-cost)/total*100,2) if total else -100)
+@app.post('/api/documents/preview')
+def preview_document(file: UploadFile = File(...), a=Depends(auth)):
+    try:
+        data = file.file.read(MAX_BYTES + 1)
+        return {"text": document_text(file.filename or "", data)}
+    except Exception as exc:
+        raise HTTPException(422, str(exc) if isinstance(exc, ValueError) else "Unable to read document") from exc
+    finally:
+        file.file.close()
+
 @app.post('/api/rfq')
 def rfq(body:RFQ,a=Depends(auth)):
     t,_=a; id=hashlib.sha256(body.source_id.encode()).hexdigest()[:24]
