@@ -23,7 +23,7 @@ def db():
     finally: c.close()
 def init():
     with db() as c:
-        for table in ['products','customers','quotes','audit','orders','inbox','outbox','settings']:
+        for table in ['products','customers','quotes','audit','orders','inbox','outbox','settings','workflows']:
             c.execute(f'CREATE TABLE IF NOT EXISTS {table}(tenant TEXT,id TEXT,data TEXT,PRIMARY KEY(tenant,id))')
         for tenant in ['demo','other']:
             for i,(name,unit,cost) in enumerate([('Sodium chloride industrial grade','kg',120),('Ethanol 99%','L',240),('Steel sheet 304','kg',450),('Acetone technical grade','L',180),('Copper wire','m',320)]):
@@ -72,16 +72,40 @@ def rfq(body:RFQ,a=Depends(auth)):
             if old['text']!=body.text or old['customer']!=body.customer: raise HTTPException(409,'Source ID already used')
             return dict(id=id,**old)
         customer=crm(c,t).account(body.customer); products=erp(c,t).catalog(); policy=pricing_policy(c,t)
+        row=c.execute("SELECT data FROM workflows WHERE tenant=? AND id=?",(t,id)).fetchone()
+        state=json.loads(row[0]) if row else {"request":body.model_dump(),"attempts":0}
+        if state["request"]!=body.model_dump(): raise HTTPException(409,'Source ID already used')
+        state["attempts"]+=1
+        state["status"]="running"
+        put(c,'workflows',t,id,state)
     try:
-        extracted, mode = extract_request(body.text)
+        if "extraction" in state:
+            from extraction import Extraction
+            extracted=Extraction.model_validate(state["extraction"])
+            mode=state["mode"]
+        else:
+            extracted,mode=extract_request(body.text)
+            with db() as c:
+                state.update(extraction=extracted.model_dump(),mode=mode,status="extracted")
+                put(c,'workflows',t,id,state)
+        q=orchestrate(extracted,mode,body.customer,body.text,customer,products,policy)
     except Exception as exc:
-        raise HTTPException(503,'Extraction unavailable; retry safely') from exc
-    q=orchestrate(extracted,mode,body.customer,body.text,customer,products,policy)
+        with db() as c:
+            state["status"]="retryable"
+            put(c,'workflows',t,id,state)
+        raise HTTPException(503,'Workflow unavailable; retry with same source ID') from exc
     with db() as c:
         existing=c.execute('SELECT data FROM quotes WHERE tenant=? AND id=?',(t,id)).fetchone()
         if existing: raise HTTPException(409,'Concurrent request; retry')
         put(c,'inbox',t,id,body.model_dump()); put(c,'quotes',t,id,q); audit(c,t,'draft',id)
+        state['status']='completed'; put(c,'workflows',t,id,state)
     return dict(id=id,**q)
+@app.get('/api/workflows/{id}')
+def workflow_status(id:str,a=Depends(auth)):
+    with db() as c:
+        state=get(c,'workflows',a[0],id)
+    return {k:state[k] for k in ('status','attempts')}
+
 @app.get('/api/integrations/status')
 def integration_status(a=Depends(auth)):
     return {"erp":{"provider":"sqlite","mode":"simulated"},"crm":{"provider":"sqlite","mode":"simulated"}}
